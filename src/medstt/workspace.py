@@ -1,0 +1,299 @@
+"""Create workspaces and resolve their settings and file paths.
+
+A workspace holds ``medstt.yaml``, pipeline inputs and outputs, and a local
+Hugging Face cache. Commands select it with ``--workdir``, then
+``MEDSTT_WORKDIR``, then the current directory.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+WORKDIR_ENV = "MEDSTT_WORKDIR"
+CONFIG_FILENAME = "medstt.yaml"
+SUBDIRS = (
+    "local",
+    "nomenclature/raw",
+    "nomenclature/normalized",
+    "words",
+    "sentences",
+    "datasets",
+    "models",
+    "runs",
+    "evals",
+    "cache/hf",
+)
+
+CONFIG_TEMPLATE = """\
+# Workspace settings. Supported command-line options override matching values.
+
+# Source nomenclatures: `medstt nomenclature import` downloads each `url` into
+# nomenclature/raw/<name>.xml and writes nomenclature/normalized/<name>.jsonl.
+# `file` (a glob) selects the data file when the archive contains several.
+nomenclatures:
+  cim10:
+    format: cim10-claml
+    url: https://www.atih.sante.fr/sites/default/files/content/documents/cim10fr2024syst_claml_20231215.zip
+  orphanet:
+    format: orphanet-xml
+    url: https://www.orphacode.org/data/packs/Orphanet_Nomenclature_Pack_FR.zip
+    file: ORPHAnomenclature_fr_*.xml
+  # Bundled lists copied by medstt init into <workspace>/local/.
+  local:
+    format: local
+    path: local
+
+# Rare words: `medstt words build` reads the normalized nomenclatures and keeps,
+# for each concept, the words that are rare in general French.
+words:
+  # Normalized nomenclatures to read (default: every configured nomenclature).
+  sources: [cim10, orphanet, local]
+  # Name of the output list, written to words/<output>.jsonl.
+  output: words
+  # A word is rare when its Zipf frequency in French is at most this value
+  # (7 = extremely common, 4 = common, 2 = rare, 0 = unknown to the lexicon).
+  max_zipf: 3.0
+  # Minimum number of letters for a candidate word.
+  min_length: 4
+
+llm:
+  # Any OpenAI-compatible endpoint (vLLM, TGI, LiteLLM, ...).
+  base_url: http://localhost:8000/v1
+  model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+  # API key order: --api-key, the named environment variable, then api_key.
+  # Prefer the environment variable for a real secret.
+  api_key_env: MEDSTT_LLM_API_KEY
+  api_key: null
+  temperature: 0.8
+  max_tokens: 200
+  concurrency: 16
+  timeout: 120
+  # Extra request fields, for example to disable reasoning:
+  # extra_body: {chat_template_kwargs: {enable_thinking: false}}
+  extra_body: {}
+
+sentences:
+  # Name of the sentence set, written to sentences/<output>.jsonl.
+  output: sentences
+  domain: pratique clinique hospitalière
+  # Number of different sentences requested for each term.
+  per_word: 3
+  min_words: 8
+  max_words: 20
+  max_attempts: 4
+  # Every sentence draws one entry of each list from its ID (deterministic), so that
+  # the LLM does not write the same sentence shape every time. Edit freely; an empty
+  # list adds no constraint.
+  scenes:
+    - compte rendu d'hospitalisation dicté
+    - courrier au médecin traitant
+    - transmission infirmière
+    - observation aux urgences
+    - consultation de suivi
+    - staff ou réunion de concertation
+    - échange oral entre deux soignants
+    - compte rendu d'examen (imagerie, biologie, anatomopathologie)
+    - entretien avec le patient ou sa famille
+  forms:
+    - affirmation d'un diagnostic
+    - hypothèse à confirmer
+    - diagnostic écarté ou absent
+    - antécédent ancien
+    - question posée à un confrère
+    - consigne de traitement ou de surveillance
+    - résultat d'examen
+    - évolution sous traitement
+  subjects:
+    - le patient
+    - la patiente
+    - l'enfant
+    - une femme de soixante ans
+    - un homme jeune
+    - je, le soignant qui parle
+    - nous, l'équipe
+    - personne en particulier, formulation impersonnelle
+
+tts:
+  output: synth-medical-words
+  # vLLM-Omni speech API; the server loads the model, not the CLI.
+  base_url: http://localhost:8091/v1
+  model: Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+  api_key_env: MEDSTT_TTS_API_KEY
+  api_key: null
+  concurrency: 4
+  timeout: 300
+  max_attempts: 3
+  # Generate one recording per sentence with each of these two voice prompts.
+  voice_prompts:
+    male: >-
+      Voix d'homme adulte francophone, naturelle, claire et posée,
+      avec une diction médicale précise.
+    female: >-
+      Voix de femme adulte francophone, naturelle, claire et posée,
+      avec une diction médicale précise.
+  # Test split: same sentences, other voice styles.
+  test_voice_prompts:
+    male: >-
+      Voix d'homme âgé francophone, grave et légèrement rauque,
+      avec un débit lent et une articulation précise.
+    female: >-
+      Voix de jeune femme francophone, timbre aigu et lumineux,
+      avec un débit vif et une articulation précise.
+  sampling_rate: 16000
+  min_duration: 1.0
+  max_duration: 20.0
+
+train:
+  # Train decoder LoRA adapters; keep the encoder and base weights frozen.
+  # The adapter and processor are saved to runs/<run_name>/final/.
+  run_name: cohere-medical
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+  seed: 42
+  data:
+    # Keep all usable examples from the first source once per epoch.
+    # Sample other sources by duration relative to its weight.
+    train:
+      - path: synth-medical-words/train
+        weight: 0.8
+      - path: voxpopuli-fr/train
+        weight: 0.2
+    # Separate evaluation datasets, or a fraction held out from train.
+    eval: []
+    eval_split: 0.0
+    sampling_rate: 16000
+    max_label_tokens: 256
+  # Forwarded to transformers.Seq2SeqTrainingArguments.
+  training:
+    per_device_train_batch_size: 1
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 8
+    learning_rate: 0.00001
+    num_train_epochs: 3
+    warmup_steps: 200
+    logging_steps: 25
+    save_steps: 500
+    eval_steps: 500
+    save_total_limit: 3
+    dataloader_num_workers: 4
+
+evaluate:
+  name: eval
+  models:
+    base: CohereLabs/cohere-transcribe-03-2026
+    run: cohere-medical
+  synthetic: synth-medical-words
+  general: [voxpopuli-fr/test]
+  batch_size: 16
+  max_samples: null
+"""
+
+
+class WorkspaceError(RuntimeError):
+    """Report a missing workspace or invalid settings file."""
+
+
+@dataclass(frozen=True)
+class Workspace:
+    """Workspace root and settings loaded from its ``medstt.yaml``."""
+
+    root: Path
+    config: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def open(cls, path: str | Path | None = None) -> Workspace:
+        """Open an existing workspace and parse its settings."""
+        root = _select_root(path)
+        config_path = root / CONFIG_FILENAME
+        if not config_path.is_file():
+            raise WorkspaceError(
+                f"No {CONFIG_FILENAME} in {root}. Run `medstt init {root}` first, "
+                f"or point --workdir / ${WORKDIR_ENV} to an existing workspace."
+            )
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(config, dict):
+            raise WorkspaceError(f"{config_path} must contain a YAML mapping.")
+        return cls(root=root, config=config)
+
+    @classmethod
+    def init(cls, path: str | Path | None = None) -> Workspace:
+        """Create workspace folders and add default settings if absent."""
+        root = _select_root(path)
+        for name in SUBDIRS:
+            (root / name).mkdir(parents=True, exist_ok=True)
+        # Wheels carry the lists inside medstt; editable installs use the repository.
+        bundled = Path(__file__).resolve().parent / "local"
+        if not bundled.is_dir():
+            bundled = Path(__file__).resolve().parents[2] / "local"
+        lists = sorted(bundled.glob("*.txt"))
+        if not lists:
+            raise WorkspaceError("Bundled local word lists are missing; reinstall medstt.")
+        for source in lists:
+            destination = root / "local" / source.name
+            if not destination.exists():
+                # Preserve user edits when init is run again.
+                with destination.open("xb") as handle:
+                    handle.write(source.read_bytes())
+        config_path = root / CONFIG_FILENAME
+        if not config_path.exists():
+            config_path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+        return cls.open(root)
+
+    def section(self, name: str) -> dict[str, Any]:
+        """Return a settings section as a mapping, or an empty mapping if absent."""
+        value = self.config.get(name) or {}
+        if not isinstance(value, dict):
+            raise WorkspaceError(f"Section `{name}` of {CONFIG_FILENAME} must be a mapping.")
+        return value
+
+    def subdir(self, name: str) -> Path:
+        """Return a workspace subdirectory, creating it if needed."""
+        path = self.root / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def resolve(self, path: str | Path, base: str | None = None) -> Path:
+        """Find an input under ``base``, the workspace root, or the current directory.
+
+        Absolute paths are used as given. A path that does not exist is placed
+        under the workspace's ``base`` directory when one is provided.
+        """
+        path = Path(path).expanduser()
+        if path.is_absolute():
+            return path
+        candidates = []
+        if base:
+            candidates.append(self.root / base / path)
+        candidates += [self.root / path, Path.cwd() / path]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return candidates[0].resolve()
+
+    def activate(self) -> None:
+        """Select the workspace's HF cache unless ``HF_HOME`` is already set.
+
+        Call this before loading libraries that read Hugging Face cache paths.
+        """
+        os.environ.setdefault("HF_HOME", str(self.root / "cache" / "hf"))
+
+
+def _select_root(path: str | Path | None) -> Path:
+    """Choose and normalize the workspace directory."""
+    raw = path or os.environ.get(WORKDIR_ENV) or Path.cwd()
+    return Path(raw).expanduser().resolve()
+
+
+def pick(cli_value: Any, section: dict[str, Any], key: str, default: Any = None) -> Any:
+    """Choose a CLI value, then a non-null setting, then the default."""
+    if cli_value is not None:
+        return cli_value
+    value = section.get(key)
+    return default if value is None else value
